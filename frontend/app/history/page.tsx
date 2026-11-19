@@ -1,22 +1,26 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import toast from 'react-hot-toast';
 import { useStore } from '@/lib/store';
 import { HistoryEventSkeleton } from '@/components/Skeleton';
 import {
-  rpc,
+  rpcGetEvents,
+  rpcGetLatestLedger,
   INVOICE_CONTRACT_ID,
   POOL_CONTRACT_ID,
   scValToNative,
   formatUSDC,
   fromStroops,
   truncateAddress,
+  stablecoinLabel,
+  USDC_TOKEN_ID,
 } from '@/lib/stellar';
 
 const EXPLORER_BASE = 'https://stellar.expert/explorer/testnet';
-const PAGE_SIZE = 20;
+const PAGE_SIZE = 50;
 const EVENT_LIMIT = 200;
+const INDEXER_URL = process.env.NEXT_PUBLIC_INDEXER_URL || 'http://localhost:3001';
 
 type EventKind =
   | 'invoice_created'
@@ -38,6 +42,7 @@ interface HistoryEvent {
   timestamp: string;
   ledger: number;
   txHash: string;
+  token?: string;
 }
 
 const KIND_LABELS: Record<EventKind, string> = {
@@ -101,9 +106,10 @@ function parseEvents(rawEvents: any[], walletAddress: string): HistoryEvent[] {
       let amount: bigint | undefined;
       let interest: bigint | undefined;
       let address: string | undefined;
+      let token: string | undefined;
       let relevant = false;
 
-      if (ns === 'INVOICE' && contract === INVOICE_CONTRACT_ID) {
+      if (ns === 'invoice' && contract === INVOICE_CONTRACT_ID) {
         if (action === 'created') {
           const [id, owner, amt] = Array.isArray(val) ? val : [val, undefined, undefined];
           invoiceId = BigInt(id as bigint);
@@ -124,7 +130,7 @@ function parseEvents(rawEvents: any[], walletAddress: string): HistoryEvent[] {
           kind = 'invoice_defaulted';
           relevant = ownedInvoiceIds.has(invoiceId);
         }
-      } else if (ns === 'POOL' && contract === POOL_CONTRACT_ID) {
+      } else if (ns === 'pool' && contract === POOL_CONTRACT_ID) {
         if (action === 'deposit') {
           const [inv, amt] = Array.isArray(val) ? val : [val, undefined];
           address = String(inv);
@@ -166,6 +172,7 @@ function parseEvents(rawEvents: any[], walletAddress: string): HistoryEvent[] {
         timestamp: e.ledgerClosedAt ?? '',
         ledger: Number(e.ledger ?? 0),
         txHash: e.txHash ?? '',
+        token: token ?? USDC_TOKEN_ID,
       });
     } catch {
       // skip malformed events
@@ -187,7 +194,16 @@ function formatTs(ts: string): string {
 }
 
 function exportCSV(events: HistoryEvent[]) {
-  const header = ['Date', 'Type', 'Invoice ID', 'Amount (USD)', 'Interest (USD)', 'Address', 'Tx Hash'];
+  const tokenSymbol = events.length > 0 ? stablecoinLabel(events[0].token || USDC_TOKEN_ID) : 'USD';
+  const header = [
+    'Date',
+    'Type',
+    'Invoice ID',
+    `Amount (${tokenSymbol})`,
+    `Interest (${tokenSymbol})`,
+    'Address',
+    'Tx Hash',
+  ];
   const rows = events.map((e) => [
     e.timestamp ? new Date(e.timestamp).toISOString() : '',
     KIND_LABELS[e.kind],
@@ -223,6 +239,16 @@ export default function HistoryPage() {
   const [hasMore, setHasMore] = useState(false);
   const [cursor, setCursor] = useState<string | undefined>(undefined);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [kindFilter, setKindFilter] = useState<EventKind | 'all'>('all');
+  const [sortDir, setSortDir] = useState<'desc' | 'asc'>('desc');
+
+  const filteredEvents = useMemo(() => {
+    const filtered = kindFilter === 'all' ? events : events.filter((e) => e.kind === kindFilter);
+    return filtered.sort((a, b) => {
+      const cmp = a.ledger - b.ledger;
+      return sortDir === 'desc' ? -cmp : cmp;
+    });
+  }, [events, kindFilter, sortDir]);
 
   const fetchEvents = useCallback(
     async (append = false, nextCursor?: string) => {
@@ -240,22 +266,63 @@ export default function HistoryPage() {
       else setLoadingMore(true);
 
       try {
-        const latest = await rpc.getLatestLedger();
-        const startLedger = Math.max(1, latest.sequence - 500_000);
+        let parsed: HistoryEvent[] = [];
+        let responseCursor: string | undefined;
 
-        const response = await rpc.getEvents({
-          ...(nextCursor ? { cursor: nextCursor } : { startLedger }),
-          filters: [
-            {
-              type: 'contract',
-              contractIds: [INVOICE_CONTRACT_ID, POOL_CONTRACT_ID],
-            },
-          ],
-          limit: EVENT_LIMIT,
-        });
+        // Try indexer API first (Option A optimization from #240)
+        if (INDEXER_URL) {
+          try {
+            const params = new URLSearchParams({
+              limit: EVENT_LIMIT.toString(),
+              ...(nextCursor ? { cursor: nextCursor } : {}),
+            });
+            if (INVOICE_CONTRACT_ID) params.append('contract_id', INVOICE_CONTRACT_ID);
+            if (POOL_CONTRACT_ID) params.append('contract_id', POOL_CONTRACT_ID);
 
-        const raw = response.events ?? [];
-        const parsed = parseEvents(raw, wallet.address);
+            const res = await fetch(`${INDEXER_URL}/events?${params.toString()}`);
+            if (res.ok) {
+              const data = await res.json();
+              const raw = (Array.isArray(data.events) ? data.events : []).map((e: unknown) => {
+                const evt = e as Record<string, unknown>;
+                return {
+                  contractId: evt.contractId,
+                  topic: evt.topic ?? [],
+                  value: evt.value,
+                  ledger: evt.ledgerSequence,
+                  ledgerClosedAt: evt.ledgerClosedAt,
+                  txHash: evt.txHash,
+                };
+              });
+              parsed = parseEvents(raw, wallet.address);
+            }
+          } catch (indexerErr) {
+            console.warn('[History] Indexer unavailable, falling back to Horizon:', indexerErr);
+          }
+        }
+
+        let fetchedCount = parsed.length;
+
+        // Fallback to Horizon RPC if indexer didn't work
+        if (parsed.length === 0) {
+          const latest = await rpcGetLatestLedger();
+          const startLedger = Math.max(1, latest.sequence - 500_000);
+
+          const response = await rpcGetEvents({
+            ...(nextCursor ? { cursor: nextCursor } : { startLedger }),
+            filters: [
+              {
+                type: 'contract',
+                contractIds: [INVOICE_CONTRACT_ID, POOL_CONTRACT_ID].filter(Boolean) as string[],
+              },
+            ],
+            limit: EVENT_LIMIT,
+          });
+
+          const raw = response.events ?? [];
+          fetchedCount = raw.length;
+          responseCursor = response.cursor;
+          parsed = parseEvents(raw, wallet.address);
+        }
 
         if (append) {
           setEvents((prev) => [...prev, ...parsed]);
@@ -264,11 +331,7 @@ export default function HistoryPage() {
           setVisible(PAGE_SIZE);
         }
 
-        const responseCursor =
-          typeof response === 'object' && response !== null && 'cursor' in response
-            ? (response as { cursor?: string }).cursor
-            : undefined;
-        setHasMore(raw.length === EVENT_LIMIT && Boolean(responseCursor));
+        setHasMore(fetchedCount === EVENT_LIMIT && Boolean(responseCursor));
         setCursor(responseCursor);
       } catch (e) {
         toast.error('Failed to load transaction history. Make sure contracts are deployed.');
@@ -289,8 +352,8 @@ export default function HistoryPage() {
     fetchEvents();
   }, [wallet.connected, wallet.address, fetchEvents]);
 
-  const visibleEvents = events.slice(0, visible);
-  const canRevealMore = visible < events.length;
+  const visibleEvents = filteredEvents.slice(0, visible);
+  const canRevealMore = visible < filteredEvents.length;
 
   function handleLoadMore() {
     if (canRevealMore) {
@@ -301,7 +364,7 @@ export default function HistoryPage() {
   }
 
   return (
-    <div className="min-h-screen pt-24 pb-16 px-6">
+    <div className="min-h-screen pt-24 pb-16 px-4 sm:px-6">
       <div className="max-w-3xl mx-auto">
         <div className="mb-8 flex flex-wrap items-start justify-between gap-4">
           <div>
@@ -311,7 +374,7 @@ export default function HistoryPage() {
           {events.length > 0 && (
             <div className="flex gap-2 print:hidden">
               <button
-                onClick={() => exportCSV(events)}
+                onClick={() => exportCSV(filteredEvents)}
                 className="px-4 py-2 bg-brand-card border border-brand-border rounded-xl text-sm font-medium hover:border-brand-gold/50 hover:text-brand-gold transition-colors"
               >
                 Export CSV
@@ -326,6 +389,32 @@ export default function HistoryPage() {
           )}
         </div>
 
+        {events.length > 0 && (
+          <div className="mb-4 flex flex-wrap items-center gap-3">
+            <div className="flex flex-wrap gap-1.5">
+              {(['all', ...(Object.keys(KIND_LABELS) as EventKind[])] as const).map((k) => (
+                <button
+                  key={k}
+                  onClick={() => setKindFilter(k)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                    kindFilter === k
+                      ? 'bg-brand-gold text-brand-dark border-brand-gold'
+                      : 'bg-brand-card border-brand-border text-brand-muted hover:text-white'
+                  }`}
+                >
+                  {k === 'all' ? 'All' : KIND_LABELS[k]}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => setSortDir((d) => (d === 'desc' ? 'asc' : 'desc'))}
+              className="px-3 py-1.5 text-xs font-medium rounded-lg border border-brand-border bg-brand-card text-brand-muted hover:text-white transition-colors"
+            >
+              {sortDir === 'desc' ? '↓ Newest' : '↑ Oldest'}
+            </button>
+          </div>
+        )}
+
         {!wallet.connected ? (
           <div className="flex flex-col items-center justify-center py-32 text-center">
             <div className="text-4xl mb-4">◈</div>
@@ -338,9 +427,13 @@ export default function HistoryPage() {
               <HistoryEventSkeleton key={i} />
             ))}
           </div>
-        ) : events.length === 0 ? (
+        ) : filteredEvents.length === 0 ? (
           <div className="p-12 bg-brand-card border border-brand-border rounded-2xl text-center">
-            <p className="text-brand-muted">No on-chain activity found for this wallet.</p>
+            <p className="text-brand-muted">
+              {kindFilter !== 'all'
+                ? 'No events match the selected filter.'
+                : 'No on-chain activity found for this wallet.'}
+            </p>
           </div>
         ) : (
           <>
@@ -365,12 +458,12 @@ export default function HistoryPage() {
                       )}
                       {evt.amount !== undefined && (
                         <span className="text-sm text-brand-gold font-semibold">
-                          {formatUSDC(evt.amount)}
+                          {formatUSDC(evt.amount)} {stablecoinLabel(evt.token || USDC_TOKEN_ID)}
                         </span>
                       )}
                       {evt.interest !== undefined && evt.interest > 0n && (
                         <span className="text-xs text-brand-muted">
-                          +{formatUSDC(evt.interest)} interest
+                          +{formatUSDC(evt.interest)} {stablecoinLabel(evt.token || USDC_TOKEN_ID)} interest
                         </span>
                       )}
                       {evt.address && evt.kind !== 'invoice_created' && (
@@ -413,6 +506,4 @@ export default function HistoryPage() {
       </div>
     </div>
   );
-}
-  /* Added by bounty-bot */
 }

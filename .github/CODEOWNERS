@@ -1,0 +1,8 @@
+# Contract changes require review from the contract maintainers team.
+/contracts/ @astera-hq/contract-maintainers
+/frontend/ @astera-hq/frontend-maintainers
+/indexer/ @astera-hq/indexer-maintainers
+/compliance-service/ @astera-hq/service-maintainers
+/mock-service/ @astera-hq/service-maintainers
+/oracle-service/ @astera-hq/service-maintainers
+/.github/ @astera-hq/repository-maintainers

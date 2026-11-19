@@ -14,27 +14,13 @@ import type { Invoice, InvoiceStatus } from './types';
 
 // ---- Cache with 5-minute TTL ----
 
-interface CacheEntry<T> {
-  data: T;
-  timestamp: number;
+interface AnalyticsCacheEntry {
+  data: AnalyticsDashboardData;
+  fetchedAt: number;
 }
 
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const cache = new Map<string, CacheEntry<unknown>>();
-
-function getCached<T>(key: string): T | null {
-  const entry = cache.get(key) as CacheEntry<T> | undefined;
-  if (!entry) return null;
-  if (Date.now() - entry.timestamp > CACHE_TTL) {
-    cache.delete(key);
-    return null;
-  }
-  return entry.data;
-}
-
-function setCache<T>(key: string, data: T): void {
-  cache.set(key, { data, timestamp: Date.now() });
-}
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+let analyticsCache: AnalyticsCacheEntry | null = null;
 
 // ---- Data Types ----
 
@@ -146,8 +132,9 @@ function generateInvoiceFunnel(invoices: Invoice[]): InvoiceFunnelData[] {
     const status = inv.status as InvoiceStatus;
     const amount = Number(inv.amount) / 10_000_000;
     if (status in stages) {
-      stages[status].count++;
-      stages[status].value += amount;
+      const stage = stages[status as keyof typeof stages]!;
+      stage.count++;
+      stage.value += amount;
     }
   }
 
@@ -188,12 +175,12 @@ function generateCreditScoreDistribution(invoices: Invoice[]): CreditScoreBucket
         score = 300 + Math.floor(Math.random() * 550);
     }
 
-    if (score >= 850) buckets[5].count++;
-    else if (score >= 750) buckets[4].count++;
-    else if (score >= 650) buckets[3].count++;
-    else if (score >= 500) buckets[2].count++;
-    else if (score >= 300) buckets[1].count++;
-    else buckets[0].count++;
+    if (score >= 850) buckets[5]!.count++;
+    else if (score >= 750) buckets[4]!.count++;
+    else if (score >= 650) buckets[3]!.count++;
+    else if (score >= 500) buckets[2]!.count++;
+    else if (score >= 300) buckets[1]!.count++;
+    else buckets[0]!.count++;
   }
 
   return buckets;
@@ -229,9 +216,9 @@ function generateTopSmes(invoices: Invoice[]): TopSme[] {
 // ---- Main Fetch Function ----
 
 export async function fetchAnalyticsData(): Promise<AnalyticsDashboardData> {
-  // Check cache first
-  const cached = getCached<AnalyticsDashboardData>('analytics-dashboard');
-  if (cached) return cached;
+  if (analyticsCache && Date.now() - analyticsCache.fetchedAt < CACHE_TTL_MS) {
+    return analyticsCache.data;
+  }
 
   try {
     // Fetch on-chain data in parallel
@@ -261,8 +248,10 @@ export async function fetchAnalyticsData(): Promise<AnalyticsDashboardData> {
       recentEvents: events.slice(0, 20),
     };
 
-    // Cache the result
-    setCache('analytics-dashboard', data);
+    analyticsCache = {
+      data,
+      fetchedAt: Date.now(),
+    };
     return data;
   } catch (error) {
     console.error('[Analytics] Failed to fetch analytics data:', error);
@@ -294,9 +283,9 @@ export function truncateAddress(address: string, chars = 6): string {
 // ---- Cache Management ----
 
 export function clearAnalyticsCache(): void {
-  cache.clear();
+  analyticsCache = null;
 }
 
 export function getAnalyticsCacheTTL(): number {
-  return CACHE_TTL;
+  return CACHE_TTL_MS;
 }

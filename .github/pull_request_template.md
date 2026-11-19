@@ -1,25 +1,22 @@
 ## Summary
 
-<!-- Brief description of the changes -->
+<!-- What changed and why? -->
 
-## Related Issue
+Closes #N
 
-<!-- Link the issue this PR addresses -->
-Closes #
+**Change type:** <!-- feat, fix, docs, chore, test, etc. -->
+**Contracts touched:** <!-- list paths, or "none" -->
 
-## Changes
+## Contract safety
 
-<!-- List the changes made -->
--
--
+<!-- Mark N/A for non-contract changes. -->
 
-## Testing
+- [ ] Storage keys and layouts are unchanged, or migration/upgrade compatibility is explained.
+- [ ] Authorization, fund movement, and failure paths were reviewed.
+- [ ] New or changed events and their consumer impact are documented.
+- [ ] WASM size impact was measured or is not applicable.
 
-<!-- Describe how you tested your changes -->
-- [ ] `cargo test` passes (if contracts changed)
-- [ ] `npm run lint` passes (if frontend changed)
-- [ ] `npm run build` succeeds (if frontend changed)
+## Verification
 
-## Screenshots (if applicable)
-
-<!-- Add screenshots for UI changes -->
+**Tests added or updated:** <!-- list focused tests, or explain why none -->
+**Commands run:** <!-- include results and any checks not run -->
