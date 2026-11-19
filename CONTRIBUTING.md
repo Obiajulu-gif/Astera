@@ -1,5 +1,8 @@
 # Contributing to Astera
 
+Please follow the [Code of Conduct](CODE_OF_CONDUCT.md) when participating in
+the project.
+
 For vulnerabilities, follow the [security policy](SECURITY.md) and use private
 reporting rather than a public issue.
 
